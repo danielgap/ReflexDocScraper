@@ -1,0 +1,32 @@
+# Carpetas y archivos de entorno virtual de Python
+.venv/
+venv/
+env/
+*.pyc
+__pycache__/
+
+# Archivos de configuración de IDE
+.vscode/
+.idea/
+
+# Archivos temporales
+*.tmp
+*.log
+*.cache
+
+# Archivos ZIP generados
+*.zip
+
+# Documentación generada
+docs/
+
+# Archivos relacionados con el sistema operativo
+.DS_Store
+Thumbs.db
+
+# Archivos de configuración de Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Archivos de configuración para Windows
+*.bak
+*.swp
