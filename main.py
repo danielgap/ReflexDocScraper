@@ -1,122 +1,88 @@
 import httpx
-from selectolax.parser import HTMLParser
+from bs4 import BeautifulSoup
+from markdownify import markdownify as md
+import re
+import unicodedata
 import os
-import concurrent.futures
-import shutil
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# URL del sitemap
-sitemap_url = 'https://reflex.dev/sitemap-0.xml'
-output_dir = 'docs'  # Carpeta donde se almacenarán los archivos markdown
-zip_filename = 'reflex_docs.zip'  # Nombre del archivo ZIP final
+# Crear directorio 'docs' si no existe
+if not os.path.exists('docs'):
+    os.makedirs('docs')
 
-# Función para obtener las URLs de la sección /docs/ desde el sitemap
-def get_docs_urls(sitemap_url):
-    response = httpx.get(sitemap_url)
-    if response.status_code == 200:
-        parser = HTMLParser(response.text)
-        urls = []
-        for loc in parser.tags('loc'):
-            url = loc.text().strip()
-            if '/docs/' in url:
-                urls.append(url)
-        return urls
-    else:
-        print(f"Error al acceder al sitemap: {response.status_code}")
-        return []
+# Función para limpiar y normalizar el texto
+def clean_text(text):
+    text = unicodedata.normalize("NFKD", text)
+    text = text.encode('ascii', 'ignore').decode('utf-8')
+    text = re.sub(r'\\([_+\\-])', r'\1', text)
+    return text
 
-# Función para limpiar y filtrar el contenido relevante
-def clean_and_filter_content(html_content):
-    tree = HTMLParser(html_content)
-
-    # Eliminar menús, pies de página y otros elementos no relacionados
-    for tag in tree.css('nav, footer, header, aside, script, style'):
+# Función para limpiar el HTML y eliminar etiquetas no deseadas
+def clean_html(soup):
+    for tag in soup(['script', 'style', 'button', 'nav', 'svg', 'footer', 'noscript', 'meta', 'link', 'header']):
         tag.decompose()
+    for tag in soup.find_all(True):
+        tag.attrs = {}
+    return soup
 
-    # Extraer el contenido principal
-    main_content = tree.css_first('main, article, .content')
-    if not main_content:
-        main_content = tree.body
-
-    # Extraer el texto relevante
-    filtered_text = []
-    for node in main_content.css('h1, h2, h3, p, li'):
-        # Detectar títulos y subtítulos y formatearlos adecuadamente
-        if node.tag in ['h1', 'h2', 'h3']:
-            text = f"## {node.text(strip=True)}"
-        else:
-            text = node.text(strip=True)
-        
-        if text and text not in filtered_text:
-            filtered_text.append(text)
-
-    # Extraer bloques de código (solo Python en este caso)
-    code_blocks = [node.text(strip=True) for node in main_content.css('pre, code') if 'python' in node.attributes.get('class', '')]
-
-    return "\n\n".join(filtered_text), code_blocks
-
-# Formatear en Markdown
-def format_to_markdown(title, content, url, code_blocks):
-    markdown = f"# {title}\n\n**URL**: {url}\n\n{content}\n\n"
-
-    if code_blocks:
-        markdown += "## Ejemplos de Código\n\n"
-        for code in code_blocks:
-            markdown += f"```python\n{code}\n```\n\n"
-
-    return markdown
-
-# Guardar el contenido formateado
-def save_markdown(title, markdown_content):
-    os.makedirs(output_dir, exist_ok=True)
-    filename = os.path.join(output_dir, f"{title.replace(' ', '_').lower()}.md")
-    with open(filename, 'w', encoding='utf-8') as file:
-        file.write(markdown_content)
-    print(f"Guardado en: {filename}")
-
-# Función para scrapear el contenido de cada página
-def scrape_page(url):
+# Descargar y procesar cada página
+def process_url(url, file_name):
     try:
-        response = httpx.get(url)
-        response.raise_for_status()
+        response = httpx.get(url, timeout=10)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        soup = clean_html(soup)
 
-        # Limpieza y filtrado del contenido
-        content, code_blocks = clean_and_filter_content(response.text)
+        # Convertir el HTML a Markdown
+        markdown = md(str(soup), heading_style="ATX", strip=['a', 'div', 'span'], code_language="python")
+        markdown = clean_text(markdown)
 
-        # Extraer el título de la página
-        tree = HTMLParser(response.text)
-        title_node = tree.css_first('h1')
-        title = title_node.text(strip=True) if title_node else 'Sin título'
+        # Ajustar y limpiar el Markdown
+        markdown = re.sub(r'```python\s+```python', '```python', markdown)
+        markdown = re.sub(r'```python\n\n```', '```python\n', markdown)
+        markdown = re.sub(r'\n{2,}', '\n\n', markdown)
 
-        # Formateo en Markdown
-        markdown_content = format_to_markdown(title, content, url, code_blocks)
-
-        # Guardar en archivo Markdown
-        save_markdown(title, markdown_content)
-
+        # Guardar el archivo en la carpeta 'docs'
+        with open(f'docs/{file_name}.md', 'w', encoding='utf-8') as f:
+            f.write(markdown)
+        print(f"Guardado: docs/{file_name}.md")
     except Exception as e:
-        print(f"Error al extraer la página {url}: {e}")
+        print(f"Error procesando {url}: {e}")
 
-# Función para comprimir la carpeta de documentación en un archivo ZIP
-def create_zip(output_dir, zip_filename):
-    shutil.make_archive(zip_filename.replace('.zip', ''), 'zip', output_dir)
-    print(f"Documentación comprimida en: {zip_filename}")
+# Descargar y procesar el sitemap
+def get_urls_from_sitemap(sitemap_url):
+    response = httpx.get(sitemap_url)
+    sitemap_soup = BeautifulSoup(response.content, 'xml')
+    urls = [url_tag.text for url_tag in sitemap_soup.find_all('loc')]
+    return urls
 
-# Función principal
-def main():
-    # Obtener todas las URLs de la documentación
-    docs_urls = get_docs_urls(sitemap_url)
-
-    if docs_urls:
-        print(f"Se encontraron {len(docs_urls)} páginas en la documentación.")
+# Función para ejecutar el procesamiento multihilo
+def download_all_pages(sitemap_url):
+    urls = get_urls_from_sitemap(sitemap_url)
+    
+    # Usar un ThreadPoolExecutor para el procesamiento multihilo
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = []
+        for url in urls:
+            # Usar el último segmento de la URL como nombre de archivo
+            file_name = url.split('/')[-2] if url.endswith('/') else url.split('/')[-1]
+            futures.append(executor.submit(process_url, url, file_name))
         
-        # Ejecutar scraping en paralelo usando múltiples hilos
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-            executor.map(scrape_page, docs_urls)
-        
-        # Comprimir la carpeta docs en un archivo ZIP
-        create_zip(output_dir, zip_filename)
-    else:
-        print("No se encontraron URLs de documentación.")
+        # Mostrar el estado de las descargas
+        for future in as_completed(futures):
+            future.result()
 
-if __name__ == '__main__':
-    main()
+# Crear un archivo ZIP con todos los documentos Markdown
+def zip_markdown_files():
+    zip_file_name = 'docs.zip'
+    with zipfile.ZipFile(zip_file_name, 'w') as zipf:
+        for root, dirs, files in os.walk('docs'):
+            for file in files:
+                zipf.write(os.path.join(root, file), file)
+    print(f"Archivos comprimidos en {zip_file_name}")
+
+# Ejecutar el programa
+if __name__ == "__main__":
+    sitemap_url = 'https://reflex.dev/sitemap-0.xml'
+    download_all_pages(sitemap_url)
+    zip_markdown_files()
